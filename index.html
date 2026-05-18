@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Obsidian Link Converter</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 2rem;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+        }
+        .header {
+            margin-bottom: 2rem;
+        }
+        .header p {
+            color: #888;
+            font-size: 0.9rem;
+            margin-top: 0.25rem;
+        }
+        .container {
+            display: flex;
+            gap: 2rem;
+        }
+        @media (max-width: 768px) {
+            .container { flex-direction: column; }
+        }
+        .column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        textarea {
+            width: 100%;
+            height: 60vh;
+            padding: 1rem;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 14px;
+            background-color: #2d2d2d;
+            color: #d4d4d4;
+            border: 1px solid #444;
+            border-radius: 6px;
+            resize: vertical;
+            box-sizing: border-box;
+        }
+        textarea:focus {
+            outline: none;
+            border-color: #007acc;
+        }
+        .button-group {
+            margin-top: 1rem;
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: background-color 0.2s;
+        }
+        .btn-primary  { background-color: #007acc; color: white; }
+        .btn-primary:hover  { background-color: #005f9e; }
+        .btn-secondary { background-color: #4CAF50; color: white; }
+        .btn-secondary:hover { background-color: #45a049; }
+        .btn-reverse  { background-color: #b58900; color: white; }
+        .btn-reverse:hover  { background-color: #8a6900; }
+        label {
+            font-weight: bold;
+            margin-bottom: 0.5rem;
+            display: block;
+        }
+        .stats {
+            margin-top: 0.5rem;
+            font-size: 0.85rem;
+            color: #4CAF50;
+            min-height: 1.2rem;
+        }
+        .warning {
+            color: #e6a817;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>Obsidian Link Converter</h1>
+        <p>Konvertiert Wikilinks ↔ GitHub-kompatible Markdown-Links. Keine Abhängigkeiten, läuft lokal im Browser.</p>
+    </div>
+
+    <div class="container">
+        <div class="column">
+            <label for="inputText">Eingabe</label>
+            <textarea id="inputText" placeholder="Füge hier deinen Obsidian-Text ein..."></textarea>
+            <div class="button-group">
+                <button class="btn-primary" onclick="convertToMarkdown()">Wikilink → Markdown</button>
+                <button class="btn-reverse" onclick="convertToWikilink()">Markdown → Wikilink</button>
+            </div>
+        </div>
+
+        <div class="column">
+            <label for="outputText">Ausgabe</label>
+            <textarea id="outputText" readonly></textarea>
+            <div class="button-group">
+                <button class="btn-secondary" onclick="copyToClipboard()">In Zwischenablage kopieren</button>
+            </div>
+            <div class="stats" id="stats"></div>
+        </div>
+    </div>
+
+    <script>
+        // Dateiendungen, die kein .md erhalten (Anhänge, Bilder, etc.)
+        const ATTACHMENT_EXTENSIONS = new Set([
+            'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'ico',
+            'pdf', 'mp4', 'webm', 'mov', 'avi', 'mkv',
+            'mp3', 'wav', 'ogg', 'flac', 'm4a',
+            'zip', 'tar', 'gz', '7z',
+            'txt', 'csv', 'json', 'xml', 'yaml', 'yml'
+        ]);
+
+        function isAttachment(filename) {
+            const dot = filename.lastIndexOf('.');
+            if (dot === -1) return false;
+            return ATTACHMENT_EXTENSIONS.has(filename.slice(dot + 1).toLowerCase());
+        }
+
+        // GitHub-kompatibler Slug (ohne Duplikat-Tracking)
+        function slugify(text) {
+            return text.toLowerCase()
+                       .trim()
+                       .replace(/\s+/g, '-')
+                       .replace(/[^\w\-äöüß]/g, '');
+        }
+
+        // Alle Überschriften der Eingabe vorberechnen inkl. Duplikat-Counter
+        // Gibt eine Map zurück: "original heading text" -> [slug, slug-1, slug-2, ...]
+        function buildHeadingSlugMap(text) {
+            const counter = {};
+            const headings = [];
+            const lines = text.split('\n');
+            for (const line of lines) {
+                const match = line.match(/^#{1,6}\s+(.+)$/);
+                if (match) {
+                    const heading = match[1].trim();
+                    const base = slugify(heading);
+                    if (counter[base] === undefined) {
+                        counter[base] = 0;
+                        headings.push({ heading, slug: base });
+                    } else {
+                        counter[base]++;
+                        headings.push({ heading, slug: `${base}-${counter[base]}` });
+                    }
+                }
+            }
+            return headings;
+        }
+
+        // Slug für einen bestimmten Heading-Text bestimmen.
+        // Bei Duplikaten: ersten Treffer nehmen (konservatives Verhalten).
+        function resolveSlug(headingText, slugMap) {
+            const base = slugify(headingText);
+            const match = slugMap.find(h => slugify(h.heading) === base);
+            return match ? match.slug : base;
+        }
+
+        // Code-Blöcke und Inline-Code vor der Konvertierung schützen
+        function protectCode(text) {
+            const placeholders = [];
+            // Fenced Code-Blöcke zuerst (mehrzeilig)
+            let result = text.replace(/```[\s\S]*?```/g, (match) => {
+                placeholders.push(match);
+                return `\x00CODE${placeholders.length - 1}\x00`;
+            });
+            // Inline-Code
+            result = result.replace(/`[^`\n]+`/g, (match) => {
+                placeholders.push(match);
+                return `\x00CODE${placeholders.length - 1}\x00`;
+            });
+            return { text: result, placeholders };
+        }
+
+        function restoreCode(text, placeholders) {
+            return text.replace(/\x00CODE(\d+)\x00/g, (_, idx) => placeholders[parseInt(idx)]);
+        }
+
+        // --- Wikilink → Markdown ---
+        function convertToMarkdown() {
+            const input = document.getElementById('inputText').value;
+            const statsField = document.getElementById('stats');
+
+            if (!input.trim()) {
+                statsField.innerHTML = '<span class="warning">Kein Eingabetext vorhanden.</span>';
+                document.getElementById('outputText').value = '';
+                return;
+            }
+
+            const slugMap = buildHeadingSlugMap(input);
+            const { text: protected_, placeholders } = protectCode(input);
+
+            const regex = /(!)?\[\[(.*?)\]\]/g;
+            let linkCount = 0;
+            let embedCount = 0;
+            let dupeWarning = false;
+
+            const result = protected_.replace(regex, (match, embedPrefix, content) => {
+                const isEmbed = embedPrefix === '!';
+
+                // Alias: [[Ziel|Anzeige]]
+                let alias = '';
+                let target = content;
+                if (content.includes('|')) {
+                    const parts = content.split('|');
+                    target = parts[0];
+                    alias = parts.slice(1).join('|');
+                }
+
+                let page = '';
+                let heading = '';
+                if (target.includes('#')) {
+                    const [p, ...h] = target.split('#');
+                    page = p;
+                    heading = h.join('#');
+                } else {
+                    page = target;
+                }
+
+                // Anchor
+                let anchor = '';
+                if (heading) {
+                    const slug = resolveSlug(heading, slugMap);
+                    // Prüfen ob Duplikat-Situation möglich
+                    const dupes = slugMap.filter(h => slugify(h.heading) === slugify(heading));
+                    if (dupes.length > 1) dupeWarning = true;
+                    anchor = '#' + slug;
+                }
+
+                // URL
+                let url = '';
+                if (page) {
+                    url = isAttachment(page) ? encodeURI(page) : encodeURI(page) + '.md';
+                }
+                url += anchor;
+
+                const displayText = alias || heading || page;
+
+                if (isEmbed) {
+                    embedCount++;
+                    return `![${displayText}](${url})`;
+                } else {
+                    linkCount++;
+                    return `[${displayText}](${url})`;
+                }
+            });
+
+            document.getElementById('outputText').value = restoreCode(result, placeholders);
+
+            let msg = `${linkCount} Link(s) und ${embedCount} Embed(s) konvertiert.`;
+            if (dupeWarning) {
+                msg += ' <span class="warning">⚠ Doppelte Überschriften erkannt — Anker-Zuordnung prüfen.</span>';
+            }
+            statsField.innerHTML = msg;
+        }
+
+        // --- Markdown → Wikilink ---
+        function convertToWikilink() {
+            const input = document.getElementById('inputText').value;
+            const statsField = document.getElementById('stats');
+
+            if (!input.trim()) {
+                statsField.innerHTML = '<span class="warning">Kein Eingabetext vorhanden.</span>';
+                document.getElementById('outputText').value = '';
+                return;
+            }
+
+            const { text: protected_, placeholders } = protectCode(input);
+
+            const regex = /(!)?\[([^\]]*)\]\(([^)]+)\)/g;
+            let count = 0;
+
+            const result = protected_.replace(regex, (match, embedPrefix, displayText, url) => {
+                // Externe URLs unberührt lassen
+                if (/^(https?:|mailto:|tel:|ftp:)/i.test(url)) return match;
+
+                const isEmbed = embedPrefix === '!';
+
+                let decoded = url;
+                try { decoded = decodeURI(url); } catch (_) {}
+
+                // .md-Endung entfernen (mit oder ohne Anker)
+                let target = decoded.replace(/\.md(#|$)/, '$1');
+
+                // Anchor: # am Anfang oder in der Mitte
+                // Ziel sauber halten
+                const targetNoAnchor = target.split('#').pop();
+                const needsAlias = displayText && displayText !== target && displayText !== targetNoAnchor;
+
+                count++;
+                const inner = needsAlias ? `${target}|${displayText}` : target;
+                return isEmbed ? `![[${inner}]]` : `[[${inner}]]`;
+            });
+
+            document.getElementById('outputText').value = restoreCode(result, placeholders);
+            statsField.innerHTML = `${count} Link(s) rückkonvertiert.`;
+        }
+
+        function copyToClipboard() {
+            const outputText = document.getElementById('outputText');
+            outputText.select();
+            outputText.setSelectionRange(0, 99999);
+            navigator.clipboard.writeText(outputText.value).then(() => {
+                const btn = document.querySelector('.btn-secondary');
+                const orig = btn.innerText;
+                btn.innerText = 'Kopiert!';
+                setTimeout(() => btn.innerText = orig, 2000);
+            });
+        }
+    </script>
+</body>
+</html>
